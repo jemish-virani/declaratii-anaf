@@ -15,6 +15,7 @@ import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Created by Alex Proca <alex.proca@gmail.com> on 14/04/16.
@@ -37,6 +38,11 @@ public class Result {
     private static final Map<String, Class<PdfCreation>> creators = new HashMap<>();
     private static final Map<String, Class<Validation>> validators = new HashMap<>();
     private static final Cache<String, Result> fileCache;
+
+    // Lock to synchronize validation calls - ANAF validator JARs have static state
+    // that gets corrupted when multiple validations run concurrently
+    // Using ReentrantLock with 2-minute timeout instead of synchronized block
+    private static final ReentrantLock VALIDATION_LOCK = new ReentrantLock(true); // fair=true for FIFO ordering
 
     static {
         InputStream packages = Thread.currentThread().getContextClassLoader().getResourceAsStream("packages.txt");
@@ -155,7 +161,13 @@ public class Result {
     }
 
     public static Result generatePdfFromXMLFile(String xmlFilePath, String declName) {
+        boolean lockAcquired = false;
         try {
+            // Wait up to 2 minutes to acquire lock, then give up
+            lockAcquired = VALIDATION_LOCK.tryLock(2, TimeUnit.MINUTES);
+            if (!lockAcquired) {
+                return new Result("Server is busy processing other documents. Please try again in a few minutes.", UNKNOWN_ERROR);
+            }
 
             Validation validator = validators.get(declName).newInstance();
             PdfCreation pdfCreation = creators.get(declName).newInstance();
@@ -213,9 +225,16 @@ public class Result {
             }
 
             return new Result(finalMessage, returnCode);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new Result("Validation was interrupted", UNKNOWN_ERROR);
         } catch (Throwable e) {
             e.printStackTrace();
             return new Result(e.getMessage(), UNKNOWN_ERROR);
+        } finally {
+            if (lockAcquired) {
+                VALIDATION_LOCK.unlock();
+            }
         }
     }
 }

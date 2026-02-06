@@ -77,83 +77,291 @@ distributions {
     }
 }
 
+// Helper function to call HTTP API
+def callHttpApi(String endpoint, Map data, String method = "POST", Map headers = [:]) {
+    try {
+        def url = new URL(endpoint)
+        def connection = url.openConnection()
+        connection.setRequestMethod(method)
+        connection.setDoOutput(true)
+        connection.setRequestProperty("Content-Type", "application/json")
+
+        // Add custom headers
+        headers.each { key, value ->
+            connection.setRequestProperty(key, value)
+        }
+
+        // Send JSON payload
+        def jsonPayload = groovy.json.JsonOutput.toJson(data)
+        connection.outputStream.withWriter { writer ->
+            writer.write(jsonPayload)
+        }
+
+        def responseCode = connection.responseCode
+        def response
+
+        if (responseCode >= 400) {
+             response = connection.errorStream?.text ?: "No error body"
+        } else {
+             response = connection.inputStream.text
+        }
+
+        println "[HTTP API] Response Code: ${responseCode}"
+        println "[HTTP API] Response: ${response}"
+
+        return [success: responseCode >= 200 && responseCode < 300, code: responseCode, body: response]
+
+    } catch (Exception e) {
+        println "[HTTP API ERROR] Failed to call : ${e.message}"
+        return [success: false, error: e.message]
+    }
+}
+
+def handleNotificationCall (Map payload) {
+    def apiEndpoint = project.hasProperty("buildWebhookUrl") ? project.property("buildWebhookUrl") : null
+    def secretKey = project.hasProperty("buildWebhookSecret") ? project.property("buildWebhookSecret") : null
+
+    if (!apiEndpoint) {
+        println "[WARNING] buildWebhookUrl not configured in gradle.properties"
+        return
+    }
+
+    def headers = [:]
+    if (secretKey) {
+        headers['x-build-secret'] = secretKey
+    }
+
+    def response = callHttpApi(apiEndpoint, payload, "POST", headers)
+    return response
+}
+
+// Helper method to download with retry logic
+def downloadWithRetry(String url, String destDir, int maxRetries = 3) {
+    def fileName = url.substring(url.lastIndexOf('/') + 1)
+    def destFile = new File(destDir, fileName)
+
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            println "[INFO] Downloading ${fileName} (Attempt ${attempt}/${maxRetries})..."
+            ant.get(src: url, dest: destDir, verbose: false, usetimestamp: true)
+            println "[SUCCESS] Downloaded ${fileName}"
+            return true
+        } catch (Exception e) {
+            println "[WARNING] Failed to download ${fileName} on attempt ${attempt}: ${e.message}"
+            if (attempt == maxRetries) {
+                println "[ERROR] Failed to download ${fileName} after ${maxRetries} attempts"
+                return false
+            }
+            // Wait before retry (exponential backoff)
+            Thread.sleep(1000 * attempt)
+        }
+    }
+    return false
+}
+
+def updateTaskName = ":updateFromANAF"
+def executedTasks = []
+def failedTasks = []
+def skippedTasks = []
+
 task stage {
     dependsOn installDist
 }
 
 task updateFromANAF {
     doFirst {
+        def startTime = new Date()
+        def failedDownloads = []
+        def successCount = 0
+        def totalCount = 0
 
-        //Download an unpack sources
-        ant.get(src: 'http://static.anaf.ro/static/10/Anaf/Declaratii_R/AplicatiiDec/src_20140505.zip', dest: 'DUKIntegrator/src.zip')
-        ant.unzip(src: 'DUKIntegrator/src.zip', dest: 'DUKIntegrator')
+        try {
+            println "=== Starting ANAF Update Process ==="
 
-        delete('DUKIntegrator/src.zip')
+            // Download and unpack sources
+            println "[INFO] Downloading source files..."
+            try {
+                ant.get(src: 'http://static.anaf.ro/static/10/Anaf/Declaratii_R/AplicatiiDec/src_20140505.zip',
+                       dest: 'DUKIntegrator/src.zip')
+                ant.unzip(src: 'DUKIntegrator/src.zip', dest: 'DUKIntegrator')
+                delete('DUKIntegrator/src.zip')
+                println "[SUCCESS] Source files downloaded and unpacked"
+            } catch (Exception e) {
+                throw new GradleException("Failed to download source files: ${e.message}")
+            }
 
-        //Download libraries
-        def versionDictionary = [:]
+            // Download libraries
+            def versionDictionary = [:]
+            def configFile = new File('config/versiuniCurente.txt')
+            def versiuni = new XmlSlurper().parse('https://static.anaf.ro/static/10/Anaf/update5/versiuni.xml')
+            def allUrls = []
 
-        def configFile = new File('config/versiuniCurente.txt')
+            // Collect all URLs
+            //Itext and dependencies
+            versiuni.integrator.iJars.childNodes().each({ allUrls.add(it.text()) })
+            //Validator and dependencies
+            versiuni.integrator.sJars.childNodes().each({ allUrls.add(it.text()) })
+            //DUK and dependencies
+            versiuni.integrator.zJars.childNodes().each({ allUrls.add(it.text()) })
+            //Download and dependencies
+            versiuni.integrator.dJars.childNodes().each({ allUrls.add(it.text()) })
 
-        // old versions xml url -> http://static.anaf.ro/static/10/Anaf/update1/versiuni.xml -> integrator version = 1.3.15.3.3
-        // new versions xml url -> https://static.anaf.ro/static/10/Anaf/update5/versiuni.xml -> integrator version = 1.4.18.3.3
-        def versiuni = new XmlSlurper().parse('https://static.anaf.ro/static/10/Anaf/update5/versiuni.xml')
-
-        def allUrls = []
-
-        //Itext and dependencies
-        versiuni.integrator.iJars.childNodes().each({
-            allUrls.add(it.text())
-        })
-
-        //Validator and dependencies
-        versiuni.integrator.sJars.childNodes().each({
-            allUrls.add(it.text())
-        })
-
-        //DUK and dependencies
-        versiuni.integrator.zJars.childNodes().each({
-            allUrls.add(it.text())
-        })
-
-        //Download and dependencies
-        versiuni.integrator.dJars.childNodes().each({
-            allUrls.add(it.text())
-        })
-
-        //Get declaratii URL's
-        versiuni.declaratii.childNodes().each({
-            def name = it.name()
-
-            //Flatten library XML
-            def library = it.children().inject([:], { acc, value ->
-
-                acc[value.name()] = value.text()
-                acc
-
+            //Get declaratii URL's
+            versiuni.declaratii.childNodes().each({
+                def name = it.name()
+                def library = it.children().inject([:], { acc, value ->
+                    acc[value.name()] = value.text()
+                    acc
+                })
+                allUrls.add(library.JURL)
+                allUrls.add(library.PURL)
+                versionDictionary[name] = library
             })
 
-            allUrls.add(library.JURL)
-            allUrls.add(library.PURL)
+            totalCount = allUrls.size()
+            println "[INFO] Starting download of ${totalCount} files..."
 
-            versionDictionary[name] = library
-        })
+            // Download all URLs with retry logic
+            allUrls.eachWithIndex { url, index ->
+                println "[PROGRESS] Downloading file ${index + 1}/${totalCount}"
+                if (downloadWithRetry(url, 'lib')) {
+                    successCount++
+                } else {
+                    failedDownloads.add(url)
+                }
+            }
 
-        //Download all url's
-        allUrls.each({
-            println it
-            ant.get(src: it, dest: 'lib')
-        })
+            // Write configuration files
+            configFile.write "Declaratie;VersiuneJ;VersiuneP\n"
+            def packages = new File("src/main/resources/packages.txt")
+            versionDictionary.each { key, value ->
+                configFile << "${key};${value.versiuneJ};${value.versiuneJ}\n"
+                packages << "${key.toString().toLowerCase()}\n"
+            }
 
-//        configFile.write versiuni.integrator.versiune "Declaratie;VersiuneJ;VersiuneP\n"
-        configFile.write "Declaratie;VersiuneJ;VersiuneP\n"
+            def endTime = new Date()
+            def duration = (endTime.time - startTime.time) / 1000
 
-        def packages = new File("src/main/resources/packages.txt")
+            // --- Generate summary ---
+            def summary = """
+                === ANAF Update Summary ===
+                Start Time: ${startTime}
+                End Time: ${endTime}
+                Duration: ${duration} seconds
+                Total Files: ${totalCount}
+                Successful: ${successCount}
+                Failed: ${failedDownloads.size()}
+            """
 
-        versionDictionary.each { key, value ->
-            configFile << "${key};${value.versiuneJ};${value.versiuneJ}\n"
-            packages << "${key.toString().toLowerCase()}\n"
+            if (failedDownloads.isEmpty()) {
+                println "[SUCCESS] All files downloaded successfully!"
+                println summary
+            }else {
+                println "[PARTIAL FAILURE] Some files failed to download!"
+                println summary
+                // --- Build payload for failed downloads ---
+                def payload = [
+                    success: false,
+                    event: "anaf_update_partial_failure",
+                    timestamp: new Date().toInstant().toString(),
+                    error: [
+                        message: "Some files failed to download",
+                        cause: "Partial failure",
+                        failedTask: updateTaskName,
+                        stackTrace: null,
+                        meta: [
+                            startTime: startTime.toInstant().toString(),
+                            endTime: endTime.toInstant().toString(),
+                            durationSeconds: duration,
+                            totalFiles: totalCount,
+                            successCount: successCount,
+                            failedCount: failedDownloads.size(),
+                            failedUrls: failedDownloads
+                        ]
+                    ]
+                ]
+                handleNotificationCall(payload)
+            }
+
+        } catch (Exception e) {
+            // Pretty print for logs
+            println "=== ANAF Update FAILED ==="
+            def payload = [
+                success: false,
+                event: "anaf_update_failed",
+                timestamp: new Date().toInstant().toString(),
+                error: [
+                    message: e.message ?: "Unknown error",
+                    cause: e.cause?.toString() ?: "No cause available",
+                    failedTask: updateTaskName,
+                    stackTrace: e.stackTrace?.take(10)*.toString() // first 10 lines
+                ]
+            ]
+            handleNotificationCall(payload)
+            throw e;
+        }
+    }
+}
+
+gradle.taskGraph.afterTask { task, taskState ->
+    if (taskState.executed) {
+        if (taskState.failure != null) {
+            failedTasks << task.path
+        } else {
+            executedTasks << task.path
+        }
+    } else if (taskState.skipped) {
+        skippedTasks << task.path
+    }
+}
+
+gradle.buildFinished { result ->
+    def apiEndpoint = project.hasProperty("buildWebhookUrl") ? project.property("buildWebhookUrl") : null
+
+    println "Executed tasks: ${executedTasks}"
+    println "Failed tasks: ${failedTasks}"
+    println "Skipped tasks: ${skippedTasks}"
+
+    // Skip handling if :updateFromANAF task is in any list
+    def allTasks = executedTasks + failedTasks + skippedTasks
+    if (allTasks.any { it.endsWith(updateTaskName) }) {
+        println "[SKIPPING] Build webhook skipped - :updateFromANAF task was present in build"
+        return
+    }
+
+    if (result.failure) {
+        println "[BUILD FAILED] Notifying backend..."
+
+        // Extract failure details
+        def failure = result.failure
+        def errorMessage = failure.message ?: "Unknown error"
+        def errorCause = failure.cause?.toString() ?: "No cause available"
+
+        // Find which task failed
+        def failedTask = "unknown"
+        if (failure.cause instanceof org.gradle.api.tasks.TaskExecutionException) {
+            failedTask = failure.cause.task?.path ?: "unknown"
         }
 
+        def payload = [
+            success: false,
+            event: "build_failed",
+            timestamp: new Date().toInstant().toString(),
+            error: [
+                message: errorMessage,
+                cause: errorCause,
+                failedTask: failedTask,
+                stackTrace: failure.stackTrace?.take(10)*.toString() // First 10 lines
+            ],
+        ]
+        handleNotificationCall(payload)
+    } else {
+        println "[BUILD SUCCESS] Notifying backend..."
+        def payload = [
+            success: true,
+            event: "build_completed",
+            timestamp: new Date().toInstant().toString(),
+        ]
+        handleNotificationCall(payload)
     }
 }

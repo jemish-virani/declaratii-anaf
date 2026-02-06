@@ -16,6 +16,8 @@ import java.io.InputStreamReader;
 import org.glassfish.jersey.media.multipart.*;
 import java.io.*;
 import com.google.common.io.Files;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 @Path("/")
 public class ValidateWebService {
@@ -108,22 +110,45 @@ public class ValidateWebService {
         try {
             // Create a temporary directory
             File tempDir = Files.createTempDir();
+            File storedFile = null;
+            String fileName = fileDetail.getFileName().toLowerCase();
 
-            // Create a new file in the temp directory with the uploaded file name
-            File storedFile = new File(tempDir, fileDetail.getFileName());
-
-            // Write uploaded file data to the new file
-            try (FileOutputStream out = new FileOutputStream(storedFile)) {
-                byte[] buffer = new byte[1024];
-                int bytesRead;
-                while ((bytesRead = uploadedInputStream.read(buffer)) != -1) {
-                    out.write(buffer, 0, bytesRead);
+            if (fileName.endsWith(".zip")) {
+                // Handle ZIP upload
+                try (ZipInputStream zis = new ZipInputStream(uploadedInputStream)) {
+                    ZipEntry entry = zis.getNextEntry();
+                    if (entry != null && !entry.isDirectory()) {
+                        // Create a new file in the temp directory with the uploaded file name
+                        storedFile = new File(tempDir, entry.getName());
+                        try (FileOutputStream out = new FileOutputStream(storedFile)) {
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = zis.read(buffer)) != -1) {
+                                out.write(buffer, 0, bytesRead);
+                            }
+                        }
+                        zis.closeEntry();
+                        System.out.println("Extracted XML from ZIP: " + storedFile.getAbsolutePath());
+                    } else {
+                        throw new IOException("Zip file does not contain a valid XML file");
+                    }
                 }
+            }else {
+                // Create a new file in the temp directory with the uploaded file name
+                storedFile = new File(tempDir, fileDetail.getFileName());
+                try (FileOutputStream out = new FileOutputStream(storedFile)) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = uploadedInputStream.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                    }
+                }
+                System.out.println("Stored XML file: " + storedFile.getAbsolutePath());
             }
+
             String lowerCaseDecName = decName.toLowerCase();
-            System.out.println("path: " + storedFile.getAbsolutePath());
-            System.out.println("fileName: " +  fileDetail.getFileName());
             Result result = Result.generatePdfFromXMLFile(storedFile.getAbsolutePath(), lowerCaseDecName);
+
             if (result.getHashCode() != null) {
                 Result.cacheResult(result);
             }
