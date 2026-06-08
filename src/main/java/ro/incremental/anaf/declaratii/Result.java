@@ -14,7 +14,9 @@ import java.io.*;
 import java.nio.charset.Charset;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
@@ -43,6 +45,24 @@ public class Result {
     // that gets corrupted when multiple validations run concurrently
     // Using ReentrantLock with 2-minute timeout instead of synchronized block
     private static final ReentrantLock VALIDATION_LOCK = new ReentrantLock(true); // fair=true for FIFO ordering
+
+    // --- Async job queue infrastructure ---
+    // Single-threaded executor with explicit queue for async validation jobs.
+    // Jobs are processed one at a time (FIFO), reusing the same VALIDATION_LOCK
+    // to ensure no concurrent validator execution with the sync /upload path.
+    private static final LinkedBlockingQueue<Runnable> JOB_QUEUE = new LinkedBlockingQueue<>();
+    private static final ExecutorService BACKGROUND_EXECUTOR = new ThreadPoolExecutor(
+            1, 1, 0L, TimeUnit.MILLISECONDS, JOB_QUEUE
+    );
+
+    // Stores completed async job results (auto-expires after 30 minutes)
+    private static final Cache<String, Result> jobResults = CacheBuilder.<String, Result>newBuilder()
+            .expireAfterWrite(30, TimeUnit.MINUTES)
+            .removalListener((RemovalListener<String, Result>) notification -> notification.getValue().cleanup())
+            .build();
+
+    // Tracks job IDs that are queued or currently processing
+    private static final Set<String> activeJobs = ConcurrentHashMap.newKeySet();
 
     static {
         InputStream packages = Thread.currentThread().getContextClassLoader().getResourceAsStream("packages.txt");
@@ -163,8 +183,8 @@ public class Result {
     public static Result generatePdfFromXMLFile(String xmlFilePath, String declName) {
         boolean lockAcquired = false;
         try {
-            // Wait up to 2 minutes to acquire lock, then give up
-            lockAcquired = VALIDATION_LOCK.tryLock(2, TimeUnit.MINUTES);
+            // Wait up to 5 minutes to acquire lock, then give up
+            lockAcquired = VALIDATION_LOCK.tryLock(5, TimeUnit.MINUTES);
             if (!lockAcquired) {
                 return new Result("Server is busy processing other documents. Please try again in a few minutes.", UNKNOWN_ERROR);
             }
@@ -235,6 +255,89 @@ public class Result {
             if (lockAcquired) {
                 VALIDATION_LOCK.unlock();
             }
+        }
+    }
+
+    // --- Async job management ---
+
+    /**
+     * Submits a validation job to the background queue.
+     * Returns a jobId immediately. The job is processed asynchronously
+     * using the same VALIDATION_LOCK (one at a time).
+     */
+    public static String submitAsyncValidation(String xmlFilePath, String declName) {
+        String jobId = UUID.randomUUID().toString();
+        activeJobs.add(jobId);
+        System.out.println("[ASYNC] Job " + jobId + " queued for declName=" + declName + ", file=" + xmlFilePath + ", queueDepth=" + JOB_QUEUE.size());
+
+        BACKGROUND_EXECUTOR.submit(() -> {
+            try {
+                System.out.println("[ASYNC] Job " + jobId + " processing started");
+                long startTime = System.currentTimeMillis();
+
+                Result result = generatePdfFromXMLFile(xmlFilePath, declName);
+                if (result.getHashCode() != null) {
+                    cacheResult(result); // also cache in fileCache for /download
+                }
+                jobResults.put(jobId, result);
+
+                long duration = System.currentTimeMillis() - startTime;
+                System.out.println("[ASYNC] Job " + jobId + " completed in " + duration + "ms, resultCode=" + result.resultCode);
+            } catch (Throwable e) {
+                e.printStackTrace();
+                jobResults.put(jobId, new Result(e.getMessage(), UNKNOWN_ERROR));
+                System.out.println("[ASYNC] Job " + jobId + " failed: " + e.getMessage());
+            } finally {
+                activeJobs.remove(jobId);
+            }
+        });
+
+        return jobId;
+    }
+
+    /**
+     * Returns the current status of an async job.
+     */
+    public static JobStatus getJobStatus(String jobId) {
+        Result result = jobResults.getIfPresent(jobId);
+        if (result != null) {
+            return new JobStatus("completed", result);
+        }
+        if (activeJobs.contains(jobId)) {
+            return new JobStatus("processing", null);
+        }
+        return new JobStatus("not_found", null);
+    }
+
+    /**
+     * Returns the number of jobs waiting in the queue (not including the currently processing one).
+     */
+    public static int getQueueDepth() {
+        return JOB_QUEUE.size();
+    }
+
+    /**
+     * Represents the status of an async validation job.
+     */
+    public static class JobStatus {
+        public final String status; // "processing", "completed", "not_found"
+        public final Result result; // null if not completed
+
+        public JobStatus(String status, Result result) {
+            this.status = status;
+            this.result = result;
+        }
+
+        public String toJSON() {
+            JSONObject json = new JSONObject();
+            json.put("status", status);
+            if (result != null) {
+                json.put("message", result.message);
+                json.put("resultCode", result.resultCode);
+                json.put("fileId", result.getHashCode());
+                json.put("decName", result.decName);
+            }
+            return json.toString();
         }
     }
 }

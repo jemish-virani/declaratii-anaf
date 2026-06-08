@@ -165,6 +165,107 @@ public class ValidateWebService {
         }
     }
 
+    @POST
+    @Path("/upload-async")
+    @Consumes(MediaType.MULTIPART_FORM_DATA)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response uploadXmlFileAsync(
+        @FormDataParam("file") InputStream uploadedInputStream,
+        @FormDataParam("file") FormDataContentDisposition fileDetail,
+        @FormDataParam("decName") String decName) {
+
+        if (uploadedInputStream == null || fileDetail == null || decName == null || decName.isEmpty()) {
+            String errorMessage = "No file uploaded or missing declaration name";
+            Result result = new Result(errorMessage, -9);
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .entity(result.toJSON())
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+
+        try {
+            // Create a temporary directory
+            File tempDir = Files.createTempDir();
+            File storedFile = null;
+            String fileName = fileDetail.getFileName().toLowerCase();
+
+            if (fileName.endsWith(".zip")) {
+                // Handle ZIP upload
+                try (ZipInputStream zis = new ZipInputStream(uploadedInputStream)) {
+                    ZipEntry entry = zis.getNextEntry();
+                    if (entry != null && !entry.isDirectory()) {
+                        storedFile = new File(tempDir, entry.getName());
+                        try (FileOutputStream out = new FileOutputStream(storedFile)) {
+                            byte[] buffer = new byte[8192];
+                            int bytesRead;
+                            while ((bytesRead = zis.read(buffer)) != -1) {
+                                out.write(buffer, 0, bytesRead);
+                            }
+                        }
+                        zis.closeEntry();
+                        System.out.println("[ASYNC] Extracted XML from ZIP: " + storedFile.getAbsolutePath());
+                    } else {
+                        throw new IOException("Zip file does not contain a valid XML file");
+                    }
+                }
+            } else {
+                storedFile = new File(tempDir, fileDetail.getFileName());
+                try (FileOutputStream out = new FileOutputStream(storedFile)) {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while ((bytesRead = uploadedInputStream.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                    }
+                }
+                System.out.println("[ASYNC] Stored XML file: " + storedFile.getAbsolutePath());
+            }
+
+            String lowerCaseDecName = decName.toLowerCase();
+
+            // Submit to background queue — returns immediately
+            String jobId = Result.submitAsyncValidation(storedFile.getAbsolutePath(), lowerCaseDecName);
+
+            JSONObject response = new JSONObject();
+            response.put("jobId", jobId);
+            response.put("status", "processing");
+            response.put("queueDepth", Result.getQueueDepth());
+
+            return Response.status(Response.Status.ACCEPTED)
+                    .entity(response.toString())
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+
+        } catch (IOException e) {
+            e.printStackTrace();
+            Result result = new Result(e.getMessage(), -9);
+            return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+                    .entity(result.toJSON())
+                    .type(MediaType.APPLICATION_JSON)
+                    .build();
+        }
+    }
+
+    @GET
+    @Path("/status/{jobId}")
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response getJobStatus(@PathParam("jobId") String jobId) {
+
+        Result.JobStatus jobStatus = Result.getJobStatus(jobId);
+
+        JSONObject response = new JSONObject();
+        response.put("jobId", jobId);
+        response.put("status", jobStatus.status);
+
+        if (jobStatus.result != null) {
+            response.put("message", jobStatus.result.message);
+            response.put("resultCode", jobStatus.result.resultCode);
+            response.put("fileId", jobStatus.result.getHashCode());
+            response.put("decName", jobStatus.result.decName);
+        }
+
+        return Response.ok(response.toString(), MediaType.APPLICATION_JSON).build();
+    }
+
     private static String json2Xml(JSONObject input) {
         return "<?xml version=\"1.0\" encoding=\"utf-8\"?>" + org.json.JSONML.toString(input);
     }
